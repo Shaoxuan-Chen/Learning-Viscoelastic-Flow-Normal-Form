@@ -15,16 +15,13 @@ the best-performing model among those in this repository:
 
 ## Scripts
 
-| Script | Paper section | Model |
-|---|---|---|
-| `polynomial_unrestricted_no_augmentation.py` | Appendix B (ablation) | Fully unrestricted polynomial normal form, no reflection-symmetry constraint, no data augmentation. Reports only the bifurcation diagram (no phase diagram), matching the paper's methodology for this ablation. |
-| `polynomial_symmetry_restricted_no_augmentation.py` | Appendix B (ablation) | Polynomial normal form restricted to even-in-`I''` terms in `f1` / odd-in-`I''` terms in `f2`, no data augmentation. Reports bifurcation diagram and phase diagram, with a mirror-pair classification correction (see below). |
-| `neural_network_direct.py` | Sec. 2.4.1 / Appendix C | Direct neural-network vector field (shared trunk + two heads), no symmetry constraint, no augmentation. |
-| `neural_network_symmetry_projected.py` | Sec. 2.4.2 | Symmetry-projected neural-network vector field: the network output is reflection-averaged so that `f1` is exact even and `f2` is exact odd in `I''`. |
-| `neural_network_symmetry_projected_negative_c_refinement.py` | Sec. 2.4.2 + iterative refinement | Same symmetry-projected network as above, plus an additional iterative fine-tuning stage that penalizes spurious stable "C" equilibria found in a specific `(G, Wi)` sub-region. |
-
-The fully-restricted polynomial model with data augmentation (Sec. 2.3,
-the paper's main polynomial result) is intentionally not included here.
+| Script | Model |
+|---|---|
+| `polynomial_unrestricted_no_augmentation.py` | Fully unrestricted polynomial normal form, no reflection-symmetry constraint, no data augmentation. Reports only the bifurcation diagram (no phase diagram); this ablation already shows substantial discrepancies at the level of its equilibrium branches, so a phase diagram is not reported for it. |
+| `polynomial_symmetry_restricted_no_augmentation.py` | Polynomial normal form restricted to even-in-`I''` terms in `f1` / odd-in-`I''` terms in `f2`, trained on the original equilibrium observations without data augmentation. This is the paper's final reported polynomial model: reflected-data augmentation was also tested but produced no further improvement, so it is not used. Reports bifurcation diagram and phase diagram, with a mirror-pair classification correction (see below). |
+| `neural_network_direct.py` | Direct neural-network vector field (shared trunk + two heads), no symmetry constraint. Reflected-data augmentation was tested and found to make the reconstruction worse, so it is not used. |
+| `neural_network_symmetry_projected.py` | Symmetry-projected neural-network vector field: the network output is reflection-averaged so that `f1` is exact even and `f2` is exact odd in `I''`. Trained without data augmentation, since the exact projection makes it redundant. |
+| `neural_network_symmetry_projected_negative_c_refinement.py` | Same symmetry-projected network as above, plus an iterative fine-tuning stage that penalizes spurious stable "C" equilibria found in a specific `(G, Wi)` sub-region. |
 
 ### Mirror-pair classification correction
 
@@ -47,8 +44,10 @@ to the data.
 
 ## Running
 
+Run from the repository root, so the scripts can find `data/data_flow.xlsx`:
+
 ```bash
-python3 neural_network_symmetry_projected.py
+python3 code/neural_network_symmetry_projected.py
 ```
 
 Each script creates its own output subfolder under `paper_figures/<script_name>/`
@@ -58,12 +57,14 @@ phase-diagram PNG + EPS figures.
 The NN scripts are self-contained (training + equilibrium search via
 `scipy.optimize.root`). The polynomial scripts additionally solve for
 equilibria via [Bertini](https://bertini.nd.edu/) (homotopy
-continuation), and hardcode a local path to a Bertini installation:
+continuation), and expect a local Bertini installation, configured near
+the top of `__main__`:
 
 ```python
-bertini_exec = "/Users/shaoxuanchen/Desktop/BertiniApple_v1.7/bertini"
-bertini_workdir = Path("/Users/shaoxuanchen/Desktop/BertiniApple_v1.7/examples/viscoelastic_flow")
+bertini_exec = "/path/to/BertiniApple_v1.7/bertini"
+bertini_workdir = Path("/path/to/BertiniApple_v1.7/examples/viscoelastic_flow")
 ```
 
-To run these two scripts elsewhere, install Bertini separately and edit
-these two paths accordingly.
+Install Bertini separately and edit these two paths to point to your
+own installation before running `polynomial_unrestricted_no_augmentation.py`
+or `polynomial_symmetry_restricted_no_augmentation.py`.

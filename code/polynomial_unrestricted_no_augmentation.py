@@ -1580,8 +1580,9 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     # 19.6 Scan Wi = 1,6,11,...,196 at fixed G
     # --------------------------------------------------------
-    bertini_exec = "/Users/shaoxuanchen/Desktop/BertiniApple_v1.7/bertini"
-    bertini_workdir = Path("/Users/shaoxuanchen/Desktop/BertiniApple_v1.7/examples/viscoelastic_flow")
+    # Edit these two paths to point to your own Bertini installation.
+    bertini_exec = "/path/to/BertiniApple_v1.7/bertini"
+    bertini_workdir = Path("/path/to/BertiniApple_v1.7/examples/viscoelastic_flow")
 
     # Each script gets its own subfolder so outputs don't mix together.
     figure_dir = Path("paper_figures") / Path(__file__).stem
