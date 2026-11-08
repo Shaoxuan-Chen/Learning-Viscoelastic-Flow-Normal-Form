@@ -6,6 +6,13 @@ data of Hopkins et al. (PRL 2021). Each script trains one model variant
 from the paper, solves for its equilibria, and reproduces the
 corresponding bifurcation diagram / phase diagram figures.
 
+## Results
+
+Phase diagram from `neural_network_symmetry_projected_negative_c_refinement.py`,
+the best-performing model among those in this repository:
+
+![Phase diagram](images/phase_diagram.png)
+
 ## Scripts
 
 | Script | Paper section | Model |
