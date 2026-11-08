@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-import pdb
 
 
 # ============================================================
@@ -66,7 +65,6 @@ def apply_param_scaler(x_np, y_np, r1_np, r2_np, scaler):
     r1_s = r1_np / (scaler["sr1"] + 1e-12)
     r2_s = r2_np / (scaler["sr2"] + 1e-12)
     return x_s, y_s, r1_s, r2_s
-  #最后训练用的数
 
 
 def build_denom_vector(exps, scaler):
@@ -203,7 +201,7 @@ def build_feature_matrices(x, y, r1, r2, exps):
 # ============================================================
 # 6. polynomial-printing helpers
 # ============================================================
-def format_term(exp):       #给一个指数 tuple，比如 (2,1,0,2)，它会把它变成可读字符串： x^2 * y * r2^2
+def format_term(exp):
     px, py, pr1, pr2 = exp
     parts = []
     if px:
@@ -217,8 +215,8 @@ def format_term(exp):       #给一个指数 tuple，比如 (2,1,0,2)，它会�
     return "1" if len(parts) == 0 else "*".join(parts)
 
 
-def top_terms(coefs, exps, k=50, thresh=1e-12): 
-                         #1. 找出绝对值大于阈值的系数 2. 按绝对值从大到小排序 3. 返回前 k 项
+def top_terms(coefs, exps, k=50, thresh=1e-12):
+    # Keep coefficients above thresh, sorted by descending magnitude.
     idx = np.where(np.abs(coefs) > thresh)[0]
     idx = idx[np.argsort(-np.abs(coefs[idx]))]
     out = []
@@ -231,10 +229,7 @@ def top_terms(coefs, exps, k=50, thresh=1e-12):
 # 7. Core helpers for separate f1 / f2 bases
 # ============================================================
 def build_all_feature_matrices(x, y, r1, r2, exps_f1, exps_f2):
-      #f1 和 f2 用的是不同的基底：#* f1：只允许 y 偶次 #* f2：只允许 y 奇次
-#       分别对 f1 和 f2 的指数表构造 feature matrix：
-       # * Phi1, dPhi1_dx, dPhi1_dy
-       # * Phi2, dPhi2_dx, dPhi2_dy  然后打包成一个字典返回。
+    # f1 and f2 use separate monomial dictionaries (exps_f1, exps_f2).
     Phi1, dPhi1_dx, dPhi1_dy = build_feature_matrices(x, y, r1, r2, exps_f1)
     Phi2, dPhi2_dx, dPhi2_dy = build_feature_matrices(x, y, r1, r2, exps_f2)
     return {
@@ -253,7 +248,6 @@ def compute_fJ_from_basis(Phi_pack, a, b):
         f1 = Phi1 @ a
         f2 = Phi2 @ b
     """
-    # 利用预先计算好的基底矩阵（Basis Matrices），通过简单的矩阵乘法（@），一次性并行计算出所有数据点上的函数值 $f_1, f_2$ 以及它们的偏导数（Jacobian 矩阵的元素）。
     Phi1 = Phi_pack["Phi1"]
     dPhi1_dx = Phi_pack["dPhi1_dx"]
     dPhi1_dy = Phi_pack["dPhi1_dy"]
@@ -288,22 +282,17 @@ def evaluate_model_scaled(
     beta,
     lambda_stab=1.0,
     lambda_sparse=1e-3,
-    w_det=100.0,       # 解决的痛点：量级差异 Of tr and det
-                        #                        trace 是一阶导数的线性组合
-                        #     \mathrm{tr}(J)=\frac{\partial f_1}{\partial x}+\frac{\partial f_2}{\partial y}
-                        #     如果每个导数大约是 0.1，那 trace 往往也是 10^{-1} 量级。
-                        # * determinant 是一阶导数的乘积组合
-                        #     \det(J)=\frac{\partial f_1}{\partial x}\frac{\partial f_2}{\partial y}
-                        #     -\frac{\partial f_1}{\partial y}\frac{\partial f_2}{\partial x}
-                        #     如果每个导数大约是 0.1，那 determinant 往往就是 10^{-2} 量级。
+    # w_det rebalances the loss: tr(J) is linear in the Jacobian
+    # entries (O(1e-1) if each entry is O(0.1)), while det(J) is
+    # quadratic (O(1e-2)), so without this weight the determinant
+    # term would be under-penalized relative to the trace term.
+    w_det=100.0,
     device="cpu",
 ):
-      #get the data first
     x_np = df["I'"].to_numpy(dtype=np.float64)
     y_np = df["I''"].to_numpy(dtype=np.float64)
     r1_np = df["G"].to_numpy(dtype=np.float64)
     r2_np = df["Wi"].to_numpy(dtype=np.float64)
-      #只对 r1_np, r2_np 做缩放
     x_np, y_np, r1_np, r2_np = apply_param_scaler(x_np, y_np, r1_np, r2_np, scaler)
 
     x = torch.tensor(x_np, dtype=torch.float64, device=device)
@@ -324,7 +313,7 @@ def evaluate_model_scaled(
     detJ = df1_dx * df2_dy - df1_dy * df2_dx
 
     Lstab = (F.relu(trJ + alpha).pow(2) + w_det * F.relu(beta - detJ).pow(2)).mean()
-    L1 = a.abs().sum() + b.abs().sum()  #稀疏loss, 鼓励系数更少
+    L1 = a.abs().sum() + b.abs().sum()
     loss = Leq + lambda_stab * Lstab + lambda_sparse * L1
 
     tr_ok = (trJ < -alpha).double().mean()
@@ -535,24 +524,22 @@ def fit_normal_form(
     r1 = torch.tensor(r1_np, dtype=torch.float64, device=device)
     r2 = torch.tensor(r2_np, dtype=torch.float64, device=device)
 
-    exps_f1 = generate_exponents(d_xy=d_xy, d_r=d_r, d_total=d_total,include_bias=include_bias, y_parity=y_parity_f1,)
-     #d_xy=4, d_r=2, d_total=5,
-     #exps_f1 = [(0, 0, 0, 1), (0, 0, 0, 2), (0, 0, 1, 0), (0, 0, 1, 1), (0, 0, 2, 0), (0, 2, 0, 0), (0, 2, 0, 1), (0, 2, 0, 2), (0, 2, 1, 0), (0, 2, 1, 1), 
-     #(0, 2, 2, 0), (0, 4, 0, 0), (0, 4, 0, 1), (0, 4, 1, 0), (1, 0, 0, 0), (1, 0, 0, 1), (1, 0, 0, 2), (1, 0, 1, 0), (1, 0, 1, 1), (1, 0, 2, 0), 
-     #(1, 2, 0, 0), (1, 2, 0, 1), (1, 2, 0, 2), (1, 2, 1, 0), (1, 2, 1, 1), (1, 2, 2, 0), (2, 0, 0, 0), (2, 0, 0, 1), (2, 0, 0, 2), (2, 0, 1, 0), 
-     #(2, 0, 1, 1), (2, 0, 2, 0), (2, 2, 0, 0), (2, 2, 0, 1), (2, 2, 1, 0), (3, 0, 0, 0), (3, 0, 0, 1), (3, 0, 0, 2), (3, 0, 1, 0), (3, 0, 1, 1), 
-     #(3, 0, 2, 0), (4, 0, 0, 0), (4, 0, 0, 1), (4, 0, 1, 0)]
+    exps_f1 = generate_exponents(
+        d_xy=d_xy, d_r=d_r, d_total=d_total,
+        include_bias=include_bias, y_parity=y_parity_f1,
+    )
     exps_f2 = generate_exponents(d_xy=d_xy, d_r=d_r, d_total=d_total, include_bias=include_bias, y_parity=y_parity_f2,)
 
     Phi_pack = build_all_feature_matrices(x, y, r1, r2, exps_f1, exps_f2)
 
-    M1 = Phi_pack["Phi1"].shape[1] #f_1 的 basis 数量。
-    M2 = Phi_pack["Phi2"].shape[1] #f_2 的 basis 数量。
+    M1 = Phi_pack["Phi1"].shape[1]
+    M2 = Phi_pack["Phi2"].shape[1]
 
     a = torch.nn.Parameter(torch.zeros(M1, dtype=torch.float64, device=device))
     b = torch.nn.Parameter(torch.zeros(M2, dtype=torch.float64, device=device))
-     #初始化全是 0--一开始：f_1=0, f_2=0， 会让 equilibrium loss 一开始就是 0，但 stability loss 不会是 0，因为 Jacobian 也是 0，不满足：{tr}(J)<-\alpha, \det(J)>\beta
-     #所以模型主要靠 stability loss 推动 coefficient 离开 0。
+    # Coefficients start at zero, so Leq is zero at t=0 but Lstab is
+    # not (the zero Jacobian fails tr(J) < -alpha, det(J) > beta), so
+    # training is initially driven by the stability loss.
 
     opt = torch.optim.Adam([a, b], lr=lr)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -609,7 +596,6 @@ def fit_normal_form(
                 f"joint={joint_ok:.3f}"
             )
             print(f"(alpha={alpha}, beta={beta})")
-    #pdb.set_trace()
     a_scaled = a.detach().cpu().numpy()
     b_scaled = b.detach().cpu().numpy()
 
@@ -668,14 +654,13 @@ def split_train_test_random(df, train_frac=0.8, seed=0):
 # 12. Bertini file loading
 # ============================================================
  
- #读取 Bertini 输出的 real_finite_solutions 文件
- #Bertini 的这个文件通常格式类似：
-# 3---root数量
-# x1_real x1_imag
-# y1_real y1_imag
-# x2_real x2_imag
-# y2_real y2_imag
-# ...
+# Reads a Bertini real_finite_solutions file, formatted as:
+#   <n_roots>
+#   x1_real x1_imag
+#   y1_real y1_imag
+#   x2_real x2_imag
+#   y2_real y2_imag
+#   ...
 def load_bertini_real_finite_solutions(filepath, imag_tol=1e-10, keep_complex=False):
     filepath = Path(filepath)
 
@@ -707,7 +692,7 @@ def load_bertini_real_finite_solutions(filepath, imag_tol=1e-10, keep_complex=Fa
 
         if keep_complex:
             roots.append([complex(x_re, x_im), complex(y_re, y_im)])
-        else: #keep_complex=False，它会要求 imaginary part 很小---so 这里只接受“真实数解”
+        else:
             if abs(x_im) > imag_tol or abs(y_im) > imag_tol:
                 raise ValueError(
                     f"Root #{k + 1} has non-negligible imaginary part: "
@@ -721,14 +706,9 @@ def load_bertini_real_finite_solutions(filepath, imag_tol=1e-10, keep_complex=Fa
 # ============================================================
 # 13. Raw-point evaluation
 # ============================================================
-# 把某一个点 (I', I'') = (x, y) plug back 到你学到的 raw polynomial 里面，计算：
-#  * f1(x,y,G,Wi)
-# * f2(x,y,G,Wi)
-# * Jacobian matrix
-# * trace
-# * determinant
-# * residual norm
-# * 稳定性符号
+# Evaluates a raw polynomial model at a point (x, y) = (I', I''):
+# f1, f2, the Jacobian, its trace/determinant, the residual norm,
+# and the resulting stability sign.
 def eval_poly_and_derivs_single_eq(x_val, y_val, G_raw, Wi_raw, coefs, exps):
     f = 0.0
     dfdx = 0.0
@@ -746,8 +726,6 @@ def eval_poly_and_derivs_single_eq(x_val, y_val, G_raw, Wi_raw, coefs, exps):
             dfdy += c * (x_val ** px) * py * (y_val ** (py - 1)) * base
 
     return f, dfdx, dfdy
-#传入 on f1 and coefficient, get f1, a f1/a x, af1/ ay
-#传入 on f2 and coefficient, get f2, a f2/a x, af2/ ay  and finally jacobina J
 def eval_fJ_raw_point(
     x_val,
     y_val,
@@ -781,7 +759,6 @@ def eval_fJ_raw_point(
                      [df2_dx, df2_dy]], dtype=float)
 
     return Fval, Jval
-#是“拼装车间”：它调用你刚才问的那个底层求导函数，把零散的偏导数拼装成标准的数学矩阵（向量场 $F$ 和雅可比矩阵 $J$）
 
 
 def evaluate_point_raw(
@@ -823,7 +800,6 @@ def evaluate_point_raw(
         "detJ": detJ,
         "stable_sign": (trJ < 0.0) and (detJ > 0.0),
     }
-#“质检中心”：它拿到矩阵后，运用线性稳定性理论（Linear Stability Theory），计算出这个点在物理/动力学意义上到底稳不稳定，并输出一份详细的体检报告（字典）。
 
 # ============================================================
 # 14. State classification
@@ -854,7 +830,7 @@ def classify_state_raw(x_raw, y_raw, margin_x=STATE_MARGIN_X, margin_y=STATE_MAR
 # ============================================================
 # 15. Root-level Bertini analysis
 # ============================================================
-def analyze_bertini_roots(  #质检中心
+def analyze_bertini_roots(
     roots,  # roots to be feed to bertini
     G_raw,
     Wi_raw,
@@ -924,8 +900,9 @@ def summarize_points_raw(
     exps_f1,
     exps_f2,
 ):
-    #读取 Bertini 算出来的所有解，做完各项质检，然后把的实验真实数据 gt_point 强行追加到这张表的最后一行。当你打印这张表时，
-    # 你可以直接对比表里的 bertini_root_1、bertini_root_2 和最后一行 ground_truth。看看理论预测的根，哪一个在数值上最贴近你的实验观测值
+    # Evaluates every Bertini root, then appends gt_point (if given)
+    # as a final "ground_truth" row, so each predicted root can be
+    # compared directly against it in the printed table.
     if len(points) != len(names):
         raise ValueError("points and names must have the same length.")
 
@@ -1003,8 +980,6 @@ def compare_bertini_roots_and_ground_truth(
 # 17. Automatic Bertini input generation and sweep
 # ============================================================
 def monomial_to_bertini(px, py, pr1, pr2, G_name="G0", Wi_name="Wi0"):
-    #monomial_to_bertini (词汇翻译官)
-      #作用：将单个多项式项（Monomial）的指数元组，翻译成 Bertini 认识的字符串
     parts = []
 
     if px > 0:
@@ -1134,8 +1109,7 @@ def collect_stable_roots_from_bertini(
         residual_tol=residual_tol,
     )
 
-    # [FIX] Appendix A: "retained when residual < 1e-6" — this filter was
-    # computed (passes_residual_tol) but never applied here before.
+    # Appendix A: roots are retained only when residual < 1e-6.
     if require_in_box:
         df_keep = df_roots[
             (df_roots["stable_sign"] == True)
@@ -1303,14 +1277,10 @@ def make_combined_bifurcation_plot(
     observations), overlay the matching G-slice in each column as
     black open circles ("GT"), matching the paper's figure style.
     """
-    # [FIX] Marker AND color are both fixed per state here (not just
-    # marker). Previously only marker was set, so matplotlib assigned
-    # colors by plot order within each column's independent color
-    # cycle — since labels_present differs per G, the same color could
-    # mean a different state in different columns.
-    # [FIX] Unified with the phase-diagram color/marker convention and
-    # with Hopkins et al. Fig. 3's AD+/AD-/C symbols (red up-triangle,
-    # blue down-triangle, orange square).
+    # Marker and color are both fixed per state (not derived from
+    # matplotlib's per-axes color cycle), matching the phase-diagram
+    # convention and Hopkins et al. Fig. 3's AD+/AD-/C symbols (red
+    # up-triangle, blue down-triangle, orange square).
     style_map = {
         "symmetric": {"marker": "x", "color": "black"},
         # D uses tab:green here (not blue) to avoid ambiguity with AD-,
@@ -1322,23 +1292,23 @@ def make_combined_bifurcation_plot(
         "other": {"marker": ".", "color": "gray"},
     }
 
-    pred_markersize = 9   # one size bigger
-    gt_markersize = 8     # one size bigger
+    pred_markersize = 9
+    gt_markersize = 8
     label_fontsize = 22
     tick_fontsize = 18
     legend_fontsize = 16
 
     n_rows = 3
     n_cols = len(G_order)
-    # [FIX] Each individual subplot has width:height = 8:4
+    # Each individual subplot has a width:height ratio of 8:4.
     fig, axes = plt.subplots(
         n_rows, n_cols, figsize=(8 * n_cols, 4 * n_rows), sharex="col"
     )
     if n_cols == 1:
         axes = axes.reshape(3, 1)
 
-    # [FIX] Track every label seen across ALL columns so the legend can
-    # be built once, independent of which column happens to contain it.
+    # Track every label seen across all columns so the legend can be
+    # built once, independent of which column happens to contain it.
     all_labels_present = set()
 
     for col, G_fixed in enumerate(G_order):
@@ -1384,8 +1354,8 @@ def make_combined_bifurcation_plot(
                     markersize=pred_markersize,
                 )
 
-        # Ground-truth overlay (experimental observations), matching the
-        # 6.20-series plotting style: black open circles.
+        # Ground-truth overlay (experimental observations), shown as
+        # black open circles.
         if df_gt is not None:
             df_gt_g = df_gt[np.isclose(df_gt["G"], G_fixed, atol=g_tol)].copy()
 
@@ -1426,9 +1396,9 @@ def make_combined_bifurcation_plot(
             ax1.set_ylabel(r"$I''$", fontsize=label_fontsize)
             ax2.set_ylabel(r"$I = I' + I''$", fontsize=label_fontsize)
 
-    # [FIX] Build the legend from a fixed set of proxy handles covering
-    # every state seen anywhere in the figure, in a stable order — not
-    # from whatever happened to be plotted in the last column.
+    # Build the legend from a fixed set of proxy handles covering
+    # every state seen anywhere in the figure, in a stable order,
+    # rather than from whatever happens to be in the last column.
     legend_handles = []
     for lab in style_map:
         if lab in all_labels_present:
@@ -1488,13 +1458,12 @@ def make_combined_bifurcation_plot(
 # ============================================================
 # 19. Main script
 # ============================================================
-# [ABLATION] Per Appendix B, the unrestricted and symmetry-restricted
-# no-augmentation ablations are reported only as bifurcation diagrams
-# (Fig. 10 / Fig. 11 style): "we do not report separate phase diagrams
-# for them ... The complete bifurcation and phase-diagram
+# Per Appendix B, the unrestricted and symmetry-restricted
+# no-augmentation ablations are reported only as bifurcation
+# diagrams (Fig. 10 / Fig. 11 style); the phase-diagram
 # reconstruction is reported only for the final symmetry-restricted
-# polynomial model with reflected-data augmentation." So this script
-# intentionally has no phase-diagram generation step.
+# model with reflected-data augmentation. This script accordingly
+# has no phase-diagram generation step.
 if __name__ == "__main__":
     # --------------------------------------------------------
     # 19.1 Seeds
@@ -1504,13 +1473,13 @@ if __name__ == "__main__":
 
     # --------------------------------------------------------
     # 19.2 Load data
-    # [FIX] Appendix A: "the final polynomial model is fitted using
-    # all available equilibrium observations" — no train/test split.
+    # Appendix A: the final model is fit using all available
+    # equilibrium observations, with no train/test split.
     # --------------------------------------------------------
     df = pd.read_excel("data/data_flow.xlsx")
     df_train = df.copy()
 
-    # [ABLATION] No reflected-data augmentation: train on the
+    # Ablation: no reflected-data augmentation, trained on the
     # original (non-mirrored) observations only.
     # df_train = augment_data_flip_y(df_train, y_col="I''")
 
@@ -1538,9 +1507,8 @@ if __name__ == "__main__":
         standardize=True,
         device="cpu",
         seed=GLOBAL_SEED,
-        # [ABLATION] No even-odd (reflection-symmetry)
-        # constraint: both f1 and f2 draw from the full, unrestricted
-        # monomial dictionary.
+        # No even-odd (reflection-symmetry) constraint: both f1 and f2
+        # draw from the full, unrestricted monomial dictionary.
         y_parity_f1=None,
         y_parity_f2=None,
     )

@@ -597,14 +597,12 @@ def classify_state_raw(x_raw, y_raw, margin_x=0.15, margin_y=0.15):
         return "AD-"
     else:
         return "other"
-       #e.g. I''>0.15(像AD), I' < 0.15（不满足AD）---bifurcation transition region
-       #e.g. I'= -0.03(like symmetric), I'' = -0.18(not symmetric)
-       #not satisfy phsics, e.g. I'<0, I''>0
 
 
 # ============================================================
 # 9.1 Mirror-pair correction (ported from
-#     !paper_polynomial_evenodd_noaug.py / !paper_NN_avg_evenodd_noaug.py).
+#     polynomial_symmetry_restricted_no_augmentation.py /
+#     neural_network_symmetry_projected.py).
 #     The averaging construction in DynamicalSystemNN.forward()
 #     enforces f1(x,-y)=f1(x,y) and f2(x,-y)=-f2(x,y) exactly, so any
 #     stable root (x,y) with y != 0 is guaranteed a stable mirror
@@ -693,16 +691,12 @@ def find_roots_nn_for_params(
     duplicate_tol=1e-4,
     require_in_box=False,
 ):
-    """固定一个参数： G, W
-然后要解：
-f_1(x,y,G,Wi)=0
-f_2(x,y,G,Wi)=0
----找 equilibrium / steady state
+    """Solve f1(x, y, G, Wi) = 0, f2(x, y, G, Wi) = 0 for equilibria at
+    a fixed (G, Wi) via a multi-start search over an initial grid.
     """
+    # n_grid x n_grid initial guesses sampled uniformly over the box
     xs = np.linspace(x_bounds[0], x_bounds[1], n_grid)
     ys = np.linspace(y_bounds[0], y_bounds[1], n_grid)
-      #10.1 xs = np.linspace(-1.1, 1.1, 41)
-      #     ys = np.linspace(-1.1, 1.1, 41) initial guss of the初始点---total 1681 inital guess
 
     roots_found = []
 
@@ -716,12 +710,10 @@ f_2(x,y,G,Wi)=0
             result=result,
         )
         return np.array([out["F1"], out["F2"]], dtype=float)
-     # 10.2 get the [f1, f2]
 
     for x0 in xs:
         for y0 in ys:
             sol = root(F_np, np.array([x0, y0]), method="hybr")
-            #10.3 对初始点解： if  res\_norm=\sqrt{f_1^2+f_2^2} > margin: continue
 
             if not sol.success:
                 continue
@@ -756,10 +748,11 @@ f_2(x,y,G,Wi)=0
                     duplicate = True
                     break
 
+            # Many initial guesses converge to the same root; treat two
+            # solutions as identical when their Euclidean distance in
+            # the (x, y) plane is below duplicate_tol.
             if duplicate:
                 continue
-            #很多 initial guesses 会收敛到同一个 root，所以这里检查新 root 和已有 root 的距离： \sqrt{(x_{\text{old}}-x_{\text{new}})^2+(y_{\text{old}}-y_{\text{new}})^2}
-                    #如果小于：duplicate_tol=1e-4, 就认为是同一个 root，不重复保存。
 
             out["G"] = G_raw
             out["Wi"] = Wi_raw
@@ -801,8 +794,8 @@ def scan_wi_and_collect_roots_nn(
     result,
     require_in_box=False,
 ):
-    """
-    固定一个 G，扫很多 Wi--- 实际扫的是：Wi=1,6,11,...,196. 每个 Wi 都调用一次：
+    """Scan a range of Wi values at fixed G, calling
+    find_roots_nn_for_params once per Wi.
     """
     all_rows = []
 
@@ -838,15 +831,14 @@ def make_combined_bifurcation_plot(
     """
     Combine the bifurcation diagrams for several G values into a single
     figure: one column per G value, three rows (I', I'', I = I'+I'').
-    Ported from paper_polynomial_evenodd_noaug.py so the NN and
-    polynomial scripts share the same figure style.
+    Ported from polynomial_symmetry_restricted_no_augmentation.py so
+    the NN and polynomial scripts share the same figure style.
     """
-    # Marker AND color are both fixed per state (not just marker), and
-    # the legend is built from a fixed proxy set covering every state
-    # seen anywhere in the figure — not just whatever the last column
-    # happens to contain.
-    # [FIX] Unified with the phase-diagram color/marker convention and
-    # with Hopkins et al. Fig. 3's AD+/AD-/C symbols (red up-triangle,
+    # Marker and color are both fixed per state (not derived from
+    # matplotlib's per-axes color cycle), and the legend is built
+    # from a fixed proxy set covering every state seen anywhere in
+    # the figure. This matches the phase-diagram convention and
+    # Hopkins et al. Fig. 3's AD+/AD-/C symbols (red up-triangle,
     # blue down-triangle, orange square).
     style_map = {
         "symmetric": {"marker": "x", "color": "black"},
@@ -1158,15 +1150,13 @@ if __name__ == "__main__":
     BIF_WI_START = 1
     BIF_WI_END = 200
     BIF_WI_STEP = 5
-    # [REVERTED] Was briefly set to False to match the sibling NN
-    # files, but that let the root solver's out-of-box extrapolation
-    # artifacts (e.g. spurious "stable C" roots at I' ~ -60, far
-    # outside the physical data range of roughly [-1, 1.05]) leak
-    # into the bifurcation/phase-diagram figures. The negative-C
-    # fine-tuning here makes the model's far-field behavior less
-    # predictable than the baseline avg model, so this file needs the
-    # box filter (matching 6.12 version1_c_only.py's own setting)
-    # even though the sibling files don't need it.
+    # Unlike the sibling NN scripts, this one keeps the box filter on:
+    # the negative-C fine-tuning makes the model's far-field behavior
+    # less predictable than the baseline model, and without this
+    # filter the root solver's out-of-box extrapolation artifacts
+    # (e.g. spurious "stable C" roots at I' ~ -60, far outside the
+    # physical data range of roughly [-1, 1.05]) leak into the
+    # bifurcation and phase-diagram figures.
     REQUIRE_IN_BOX = True
 
     # Figure 4 phase diagram settings
@@ -1328,10 +1318,9 @@ if __name__ == "__main__":
         phase_summary_csv = OUT_DIR / "nn_figure4_phase_summary.csv"
         phase_fig_path = OUT_DIR / "nn_figure4_phase_diagram.png"
 
-        # [CACHE] The (G,Wi) sweep is expensive. If a previous run
-        # already saved results, load them instead of recomputing.
-        # Delete the CSVs (or set FORCE_RECOMPUTE_PHASE=True) to force
-        # a fresh sweep.
+        # The (G, Wi) sweep is expensive. If a previous run already
+        # saved results, load them instead of recomputing. Delete the
+        # CSVs (or set FORCE_RECOMPUTE_PHASE=True) to force a fresh sweep.
         FORCE_RECOMPUTE_PHASE = False
 
         if (

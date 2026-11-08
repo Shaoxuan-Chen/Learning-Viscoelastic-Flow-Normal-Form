@@ -71,39 +71,44 @@ def split_train_test_random(df, train_frac=0.8, seed=0):
 
 
 # ============================================================
-# 4. Neural network model
+# 4. Neural network model: averaging hard constraint
 # ============================================================
 class DynamicalSystemNN(nn.Module):
     def __init__(self, hidden_dim=128):
         super().__init__()
 
-        self.shared_trunk = nn.Sequential(
+        # raw input is [x, y, G, Wi]
+        self.raw_net = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
+            nn.Linear(hidden_dim, 2),
         )
 
-        self.head_f1 = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+    def raw_forward(self, x, y, r1, r2):
+        inputs = torch.stack([x, y, r1, r2], dim=1)
+        out = self.raw_net(inputs)
 
-        self.head_f2 = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+        g1 = out[:, 0]
+        g2 = out[:, 1]
+
+        return g1, g2
 
     def forward(self, x, y, r1, r2):
-        inputs = torch.stack([x, y, r1, r2], dim=1)
-        h = self.shared_trunk(inputs)
+        # raw NN output at y
+        g1_pos, g2_pos = self.raw_forward(x, y, r1, r2)
 
-        f1 = self.head_f1(h).squeeze(-1)
-        f2 = self.head_f2(h).squeeze(-1)
+        # raw NN output at -y
+        g1_neg, g2_neg = self.raw_forward(x, -y, r1, r2)
+
+        # enforce f1 even in y
+        f1 = 0.5 * (g1_pos + g1_neg)
+
+        # enforce f2 odd in y
+        f2 = 0.5 * (g2_pos - g2_neg)
 
         return f1, f2
 
@@ -379,9 +384,80 @@ def classify_state_raw(x_raw, y_raw, margin_x=0.15, margin_y=0.15):
         return "AD-"
     else:
         return "other"
-       #e.g. I''>0.15(像AD), I' < 0.15（不满足AD）---bifurcation transition region
-       #e.g. I'= -0.03(like symmetric), I'' = -0.18(not symmetric)
-       #not satisfy phsics, e.g. I'<0, I''>0
+
+
+# ============================================================
+# 9.1 Mirror-pair correction (ported from
+#     polynomial_symmetry_restricted_no_augmentation.py). The
+#     averaging construction in DynamicalSystemNN.forward() enforces
+#     f1(x,-y)=f1(x,y) and
+#     f2(x,-y)=-f2(x,y) exactly, so any stable root (x,y) with y != 0
+#     is guaranteed a stable mirror partner (x,-y) with identical
+#     trace/det. The pointwise threshold (margin_x, margin_y) can
+#     still mislabel a genuine reflection pair as two "D" roots when
+#     |y| is just under the threshold; this override fixes that
+#     without changing the threshold itself.
+# ============================================================
+MIRROR_EPS_X = 1e-3
+MIRROR_EPS_Y_SUM = 1e-3
+MIRROR_EPS_SEP = 1e-3
+
+
+def apply_mirror_pair_correction_nn(
+    roots,
+    eps_x=MIRROR_EPS_X,
+    eps_y_sum=MIRROR_EPS_Y_SUM,
+    eps_sep=MIRROR_EPS_SEP,
+    margin_x=0.15,
+):
+    # NOTE: this must only be called on roots that have ALREADY been
+    # filtered down to the accepted set (stable_sign, residual_tol,
+    # and in_box if required) — find_roots_nn_for_params() only ever
+    # appends accepted roots to roots_found, so no extra guard is
+    # needed here (unlike the polynomial version, which used to run
+    # this on the raw, unfiltered root table).
+    #
+    # This override only ever applies to a pair whose ORIGINAL
+    # threshold label was "D" on both sides. A same-x mirror pair on
+    # the C side (x < -margin_x, both labeled "C") satisfies the same
+    # (x1≈x2, y1≈-y2) geometry but must NOT be promoted to AD+/AD- —
+    # AD is defined with x > margin_x, so a C-branch mirror pair
+    # staying "C" is the physically correct outcome.
+    def _is_d_branch(r):
+        return r["label"] == "D" and r["Iprime"] > margin_x
+
+    roots = [r.copy() for r in roots]
+    used = [False] * len(roots)
+
+    for i in range(len(roots)):
+        if used[i] or not _is_d_branch(roots[i]):
+            continue
+        xi = roots[i]["Iprime"]
+        yi = roots[i]["Idoubleprime"]
+
+        for j in range(i + 1, len(roots)):
+            if used[j] or not _is_d_branch(roots[j]):
+                continue
+            xj = roots[j]["Iprime"]
+            yj = roots[j]["Idoubleprime"]
+
+            if (
+                abs(xi - xj) < eps_x
+                and abs(yi + yj) < eps_y_sum
+                and yi * yj < 0
+                and abs(yi - yj) > eps_sep
+            ):
+                if yi > yj:
+                    roots[i]["label"] = "AD+"
+                    roots[j]["label"] = "AD-"
+                else:
+                    roots[i]["label"] = "AD-"
+                    roots[j]["label"] = "AD+"
+                used[i] = True
+                used[j] = True
+                break
+
+    return roots
 
 
 # ============================================================
@@ -392,25 +468,17 @@ def find_roots_nn_for_params(
     result,
     x_bounds=(-1.1, 1.1),
     y_bounds=(-1.1, 1.1),
-    # [TEST] Temporarily set back to 1.1 (matching x_bounds/y_bounds)
-    # to compare against the 1.5 version — paper Sec 2.1 says this
-    # should be 1.5, kept as a separate parameter either way.
-    classify_bounds=(-1.1, 1.1),
     n_grid=41,
     residual_tol=1e-6,
     duplicate_tol=1e-4,
     require_in_box=False,
 ):
-    """固定一个参数： G, W
-然后要解：
-f_1(x,y,G,Wi)=0
-f_2(x,y,G,Wi)=0
----找 equilibrium / steady state
+    """Solve f1(x, y, G, Wi) = 0, f2(x, y, G, Wi) = 0 for equilibria at
+    a fixed (G, Wi) via a multi-start search over an initial grid.
     """
+    # n_grid x n_grid initial guesses sampled uniformly over the box
     xs = np.linspace(x_bounds[0], x_bounds[1], n_grid)
     ys = np.linspace(y_bounds[0], y_bounds[1], n_grid)
-      #10.1 xs = np.linspace(-1.1, 1.1, 41)
-      #     ys = np.linspace(-1.1, 1.1, 41) initial guss of the初始点---total 1681 inital guess
 
     roots_found = []
 
@@ -424,12 +492,10 @@ f_2(x,y,G,Wi)=0
             result=result,
         )
         return np.array([out["F1"], out["F2"]], dtype=float)
-     # 10.2 get the [f1, f2]
 
     for x0 in xs:
         for y0 in ys:
             sol = root(F_np, np.array([x0, y0]), method="hybr")
-            #10.3 对初始点解： if  res\_norm=\sqrt{f_1^2+f_2^2} > margin: continue
 
             if not sol.success:
                 continue
@@ -447,8 +513,8 @@ f_2(x,y,G,Wi)=0
                 continue
 
             in_box = (
-                classify_bounds[0] <= x_sol <= classify_bounds[1]
-                and classify_bounds[0] <= y_sol <= classify_bounds[1]
+                x_bounds[0] <= x_sol <= x_bounds[1]
+                and y_bounds[0] <= y_sol <= y_bounds[1]
             )
 
             if require_in_box and not in_box:
@@ -464,10 +530,11 @@ f_2(x,y,G,Wi)=0
                     duplicate = True
                     break
 
+            # Many initial guesses converge to the same root; treat two
+            # solutions as identical when their Euclidean distance in
+            # the (x, y) plane is below duplicate_tol.
             if duplicate:
                 continue
-            #很多 initial guesses 会收敛到同一个 root，所以这里检查新 root 和已有 root 的距离： \sqrt{(x_{\text{old}}-x_{\text{new}})^2+(y_{\text{old}}-y_{\text{new}})^2}
-                    #如果小于：duplicate_tol=1e-4, 就认为是同一个 root，不重复保存。
 
             out["G"] = G_raw
             out["Wi"] = Wi_raw
@@ -496,6 +563,8 @@ f_2(x,y,G,Wi)=0
             ]
         )
 
+    roots_found = apply_mirror_pair_correction_nn(roots_found)
+
     return pd.DataFrame(roots_found)
 
 
@@ -506,10 +575,9 @@ def scan_wi_and_collect_roots_nn(
     Wi_step,
     result,
     require_in_box=False,
-    n_grid=41,
 ):
-    """
-    固定一个 G，扫很多 Wi--- 实际扫的是：Wi=1,6,11,...,196. 每个 Wi 都调用一次：
+    """Scan a range of Wi values at fixed G, calling
+    find_roots_nn_for_params once per Wi.
     """
     all_rows = []
 
@@ -521,7 +589,6 @@ def scan_wi_and_collect_roots_nn(
             Wi_raw=Wi,
             result=result,
             require_in_box=require_in_box,
-            n_grid=n_grid,
         )
 
         if len(df_roots) > 0:
@@ -546,16 +613,14 @@ def make_combined_bifurcation_plot(
     """
     Combine the bifurcation diagrams for several G values into a single
     figure: one column per G value, three rows (I', I'', I = I'+I'').
-    Ported from paper_polynomial_evenodd_noaug.py so the NN and
-    polynomial scripts share the same figure style.
+    Ported from polynomial_symmetry_restricted_no_augmentation.py so
+    the NN and polynomial scripts share the same figure style.
     """
-    # [FIX] Marker AND color are both fixed per state here (not just
-    # marker). Previously only marker was set, so matplotlib assigned
-    # colors by plot order within each column's independent color
-    # cycle — since labels_present differs per G, the same color could
-    # mean a different state in different columns.
-    # [FIX] Unified with the phase-diagram color/marker convention and
-    # with Hopkins et al. Fig. 3's AD+/AD-/C symbols (red up-triangle,
+    # Marker and color are both fixed per state (not derived from
+    # matplotlib's per-axes color cycle), and the legend is built
+    # from a fixed proxy set covering every state seen anywhere in
+    # the figure. This matches the phase-diagram convention and
+    # Hopkins et al. Fig. 3's AD+/AD-/C symbols (red up-triangle,
     # blue down-triangle, orange square).
     style_map = {
         "symmetric": {"marker": "x", "color": "black"},
@@ -582,8 +647,6 @@ def make_combined_bifurcation_plot(
     if n_cols == 1:
         axes = axes.reshape(3, 1)
 
-    # [FIX] Track every label seen across ALL columns so the legend can
-    # be built once, independent of which column happens to contain it.
     all_labels_present = set()
 
     for col, G_fixed in enumerate(G_order):
@@ -670,9 +733,6 @@ def make_combined_bifurcation_plot(
             ax1.set_ylabel(r"$I''$", fontsize=label_fontsize)
             ax2.set_ylabel(r"$I = I' + I''$", fontsize=label_fontsize)
 
-    # [FIX] Build the legend from a fixed set of proxy handles covering
-    # every state seen anywhere in the figure, in a stable order — not
-    # from whatever happened to be plotted in the last column.
     legend_handles = []
     for lab in style_map:
         if lab in all_labels_present:
@@ -811,8 +871,8 @@ def plot_figure4_phase_diagram(df_phase, save_path=None):
     ax.set_ylabel(r"$Wi$", fontsize=14)
     ax.set_xlim(0.49, 0.635)
     ax.set_ylim(8, 300)
-    # [FIX] EPS doesn't support transparency: use a solid light-gray
-    # color for the grid instead of alpha, and an opaque legend frame.
+    # EPS doesn't support transparency: use a solid light-gray color
+    # for the grid instead of alpha, and an opaque legend frame.
     ax.grid(True, which="both", linestyle="--", color="lightgray")
     ax.legend(loc="lower left", fontsize=11, framealpha=1.0)
 
@@ -851,7 +911,7 @@ if __name__ == "__main__":
     DEVICE = "cpu"
 
     # NN training settings
-    HIDDEN_DIM = 128
+    HIDDEN_DIM = 50
     LAMBDA_STAB = 50
     ALPHA = 0.09
     BETA = 1e-3
@@ -863,18 +923,7 @@ if __name__ == "__main__":
     LR_GAMMA = 0.5
     STANDARDIZE = True
 
-    # [PREVIEW] The real bottleneck is n_grid (multi-start root search
-    # density): the original uses 41 (1681 scipy.optimize.root calls
-    # PER (G,Wi) point, each through the NN's autograd Jacobian). This
-    # is what was actually making everything slow, not the outer grid.
-    # Cut it down hard for a quick look; raise it back to 41 once
-    # you're ready for a real run.
-    PREVIEW_N_GRID = 9   # 9x9 = 81 starts/point, vs 1681 originally
-
     # Bifurcation scan settings
-    # [MATCH] Wi grid matched to !paper_polynomial_evenodd_noaug.py
-    # (Wi_step=5 -> Wi=1,6,...,196). n_grid (root-search density)
-    # above is left untouched.
     G_FIXED_LIST = [0.5, 0.588, 0.603]
     BIF_WI_START = 1
     BIF_WI_END = 200
@@ -882,12 +931,10 @@ if __name__ == "__main__":
     REQUIRE_IN_BOX = False
 
     # Figure 4 phase diagram settings
-    # [MATCH] Grid matched to !paper_polynomial_evenodd_noaug.py's
-    # paper-exact grid (G_STEP=0.005, WI_STEP=5).
     MAKE_FIGURE4 = True
-    FIG4_G_GRID = np.round(np.arange(0.50, 0.63 + 1e-9, 0.01), 3).tolist()
-    FIG4_WI_GRID = list(range(8, 198 + 1, 5))
-
+    FIG4_G_GRID = np.round(np.arange(0.50, 0.631, 0.01), 3).tolist()
+    FIG4_WI_GRID = list(range(8, 201, 5))
+    
 
     # ========================================================
     # 1. Setup
@@ -897,23 +944,24 @@ if __name__ == "__main__":
 
     df = pd.read_excel(DATA_PATH)
 
-        # Use full original data
-    df_train = df.reset_index(drop=True)
-
-    # [FIX] Paper Sec 2.4.1: "The direct neural-network model is
-    # trained using the original equilibrium observations without
-    # reflected-data augmentation." Augmentation was tested and found
-    # to make the direct NN reconstruction worse, so it's left off.
-    # df_train = augment_data_flip_y(df_train, y_col="I''")
-
-    # Use full original non-augmented data for evaluation/reporting
-    df_test = df.reset_index(drop=True)
-
-    print(f"Full original data size : {len(df)}")
-    print(f"Train size (no augmentation) : {len(df_train)}")
-    print(f"Eval size (same, no held-out split): {len(df_test)}")
-        
+    # df_train, df_test = split_train_test_random(
+    #     df,
+    #     train_frac=TRAIN_FRAC,
+    #     seed=SPLIT_SEED,
+    # )
     
+        # Use all data for training
+    df_train = df.reset_index(drop=True)
+    # Optional: keep df_test same as df only for evaluation/reporting
+    df_test = df_train.copy()
+    # No need for flip augmentation because symmetry is hard-coded
+    # df_train = augment_data_flip_y(df_train, y_col="I''")
+    
+    print(f"Full data size : {len(df)}")
+    print(f"Train size     : {len(df_train)}")
+    print(f"Eval size      : {len(df_test)}")
+
+    #df_train = augment_data_flip_y(df_train, y_col="I''")
 
     # ========================================================
     # 2. Train NN normal form
@@ -959,16 +1007,19 @@ if __name__ == "__main__":
             Wi_step=BIF_WI_STEP,
             result=result,
             require_in_box=REQUIRE_IN_BOX,
-            n_grid=PREVIEW_N_GRID,
         )
 
         print(f"\n[Scanned stable NN roots for G={G_fixed}]")
-        print(df_scan.to_string())
+        print(df_scan.head())
         print(f"Total kept roots: {len(df_scan)}")
+
+        csv_path = OUT_DIR / f"nn_roots_G{str(G_fixed).replace('.', 'p')}.csv"
+        df_scan.to_csv(csv_path, index=False)
+        print(f"Saved CSV to: {csv_path}")
 
         df_scan_by_G[G_fixed] = df_scan
 
-    fig_path = OUT_DIR / "nn_bifurcation_combined_preview.png"
+    fig_path = OUT_DIR / "nn_bifurcation_combined.png"
     make_combined_bifurcation_plot(
         df_scan_by_G=df_scan_by_G,
         G_order=G_FIXED_LIST,
@@ -983,14 +1034,13 @@ if __name__ == "__main__":
     if MAKE_FIGURE4:
         print("\n--- Generating Figure 4 style phase diagram ---")
 
-        phase_roots_csv = OUT_DIR / "nn_figure4_phase_roots_preview.csv"
-        phase_summary_csv = OUT_DIR / "nn_figure4_phase_summary_preview.csv"
-        phase_fig_path = OUT_DIR / "nn_figure4_phase_diagram_preview.png"
+        phase_roots_csv = OUT_DIR / "nn_figure4_phase_roots.csv"
+        phase_summary_csv = OUT_DIR / "nn_figure4_phase_summary.csv"
+        phase_fig_path = OUT_DIR / "nn_figure4_phase_diagram.png"
 
-        # [CACHE] The (G,Wi) sweep is expensive. If a previous run
-        # already saved results, load them instead of recomputing.
-        # Delete the CSVs (or set FORCE_RECOMPUTE_PHASE=True) to force
-        # a fresh sweep.
+        # The (G, Wi) sweep is expensive. If a previous run already
+        # saved results, load them instead of recomputing. Delete the
+        # CSVs (or set FORCE_RECOMPUTE_PHASE=True) to force a fresh sweep.
         FORCE_RECOMPUTE_PHASE = False
 
         if (
@@ -1018,7 +1068,6 @@ if __name__ == "__main__":
                     Wi_step=fig4_wi_step,
                     result=result,
                     require_in_box=REQUIRE_IN_BOX,
-                    n_grid=PREVIEW_N_GRID,
                 )
 
                 if len(df_g) > 0:
@@ -1040,8 +1089,6 @@ if __name__ == "__main__":
 
         print("\n[Phase counts]")
         print(df_phase["phase"].value_counts())
-        print("\n[Phase grid]")
-        print(df_phase.to_string())
 
         plot_figure4_phase_diagram(
             df_phase=df_phase,
