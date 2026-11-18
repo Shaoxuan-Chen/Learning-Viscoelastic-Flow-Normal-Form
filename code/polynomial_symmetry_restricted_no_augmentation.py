@@ -361,6 +361,8 @@ def evaluate_model_raw_exact_margin(
     lambda_sparse=1e-3,
     w_det=10.0,
     device="cpu",
+    *,
+    stability_model,
 ):
     x_np = df["I'"].to_numpy(dtype=np.float64)
     y_np = df["I''"].to_numpy(dtype=np.float64)
@@ -384,15 +386,28 @@ def evaluate_model_raw_exact_margin(
     trJ_raw = df1_dx + df2_dy
     detJ_raw = df1_dx * df2_dy - df1_dy * df2_dx
 
-    # Convert the raw-coordinate Jacobian to the scaled-coordinate
-    # Jacobian that alpha/beta were calibrated against:
-    #   d f1_scaled/d x_s = sx * d f1_raw/d x   (since x_s = x/sx)
-    #   d f2_scaled/d y_s = sy * d f2_raw/d y
-    # so tr_equiv = sx*f1_x + sy*f2_y, det_equiv = sx*sy*det_raw.
-    sx = float(scaler["sx"])
-    sy = float(scaler["sy"])
-    trJ_equiv = sx * df1_dx + sy * df2_dy
-    detJ_equiv = sx * sy * detJ_raw
+    # alpha/beta were calibrated against the Jacobian of f1, f2 with
+    # respect to the SCALED inputs (x_s, y_s), so the stability margin
+    # is re-evaluated directly in that coordinate system, using the
+    # trained scaled coefficients, rather than by rescaling the
+    # raw-coordinate Jacobian.
+    scaled_inputs = apply_param_scaler(
+        x_np, y_np, r1_np, r2_np, stability_model["scaler"]
+    )
+    scaled_tensors = [
+        torch.as_tensor(v, dtype=torch.float64, device=device)
+        for v in scaled_inputs
+    ]
+    scaled_basis = build_all_feature_matrices(
+        *scaled_tensors,
+        stability_model["exps_f1"],
+        stability_model["exps_f2"],
+    )
+    a_s = torch.as_tensor(stability_model["a_scaled"], dtype=torch.float64, device=device)
+    b_s = torch.as_tensor(stability_model["b_scaled"], dtype=torch.float64, device=device)
+    _, _, s11, s12, s21, s22 = compute_fJ_from_basis(scaled_basis, a_s, b_s)
+    trJ_equiv = s11 + s22
+    detJ_equiv = s11 * s22 - s12 * s21
 
     Lstab_exact = (
         F.relu(trJ_equiv + alpha).pow(2)
@@ -433,6 +448,7 @@ def evaluate_model_raw_exact_margin(
         "trJ_equiv_mean": trJ_equiv.mean().item(),
         "trJ_equiv_min": trJ_equiv.min().item(),
         "trJ_equiv_max": trJ_equiv.max().item(),
+        "detJ_equiv_mean": detJ_equiv.mean().item(),
     }
 
 
@@ -465,7 +481,7 @@ def summarize_raw_exact_metrics(metrics):
         "det_ok": metrics["det_ok_exact_margin"],
         "joint_ok": metrics["joint_ok_exact_margin"],
         "trJ_mean": metrics["trJ_equiv_mean"],
-        "detJ_mean": metrics["detJ_raw_mean"],
+        "detJ_mean": metrics["detJ_equiv_mean"],
     }
 
 
@@ -761,6 +777,33 @@ def eval_fJ_raw_point(
     return Fval, Jval
 
 
+def eval_J_scaled_at_raw_point(x_val, y_val, G_raw, Wi_raw, stability_model):
+    """
+    Jacobian of (f1, f2) with respect to the SCALED inputs, evaluated
+    at a raw-coordinate point, using the trained scaled coefficients.
+
+    The exported raw-input polynomial (a_raw, b_raw) is only a
+    reparametrization of the same function for Bertini root-finding;
+    its raw-coordinate Jacobian is not the quantity training enforced
+    stability on. alpha/beta were calibrated against the Jacobian in
+    scaled coordinates, so stability must be classified there too.
+    """
+    x_s, y_s, G_s, Wi_s = apply_param_scaler(
+        x_val, y_val, G_raw, Wi_raw, stability_model["scaler"]
+    )
+    _, J_s = eval_fJ_raw_point(
+        x_val=x_s,
+        y_val=y_s,
+        G_raw=G_s,
+        Wi_raw=Wi_s,
+        a_raw=stability_model["a_scaled"],
+        b_raw=stability_model["b_scaled"],
+        exps_f1=stability_model["exps_f1"],
+        exps_f2=stability_model["exps_f2"],
+    )
+    return J_s
+
+
 def evaluate_point_raw(
     x_val,
     y_val,
@@ -770,6 +813,8 @@ def evaluate_point_raw(
     b_raw,
     exps_f1,
     exps_f2,
+    *,
+    stability_model,
 ):
     Fval, Jval = eval_fJ_raw_point(
         x_val=x_val,
@@ -786,6 +831,9 @@ def evaluate_point_raw(
     f2_val = float(Fval[1])
     res_norm = float(np.linalg.norm(Fval))
 
+    # trJ/detJ/stable_sign classify stability in the scaled-input
+    # Jacobian, not the raw one returned above.
+    Jval = eval_J_scaled_at_raw_point(x_val, y_val, G_raw, Wi_raw, stability_model)
     trJ = float(np.trace(Jval))
     detJ = float(np.linalg.det(Jval))
 
@@ -932,6 +980,8 @@ def analyze_bertini_roots(
     margin_x=STATE_MARGIN_X,
     margin_y=STATE_MARGIN_Y,
     residual_tol=1e-7,  #help to sort the bertini roots
+    *,
+    stability_model,
 ):
     # NOTE: this returns the RAW, unfiltered per-point rows (every
     # Bertini root, including unstable / out-of-box / high-residual
@@ -956,6 +1006,10 @@ def analyze_bertini_roots(
             exps_f2=exps_f2,
         )
 
+        # Keep the raw residual for the Bertini tolerance check, but
+        # classify stability with the scaled-input Jacobian (see
+        # eval_J_scaled_at_raw_point).
+        Jval = eval_J_scaled_at_raw_point(x_raw, y_raw, G_raw, Wi_raw, stability_model)
         trJ = float(np.trace(Jval))
         detJ = float(np.linalg.det(Jval))
         res_norm = float(np.linalg.norm(Fval))
@@ -994,6 +1048,8 @@ def summarize_points_raw(
     b_raw,
     exps_f1,
     exps_f2,
+    *,
+    stability_model,
 ):
     # Evaluates every Bertini root, then appends gt_point (if given)
     # as a final "ground_truth" row, so each predicted root can be
@@ -1012,6 +1068,7 @@ def summarize_points_raw(
             b_raw=b_raw,
             exps_f1=exps_f1,
             exps_f2=exps_f2,
+            stability_model=stability_model,
         )
         out["name"] = name
         rows.append(out)
@@ -1032,6 +1089,8 @@ def compare_bertini_roots_and_ground_truth(
     exps_f1,
     exps_f2,
     gt_point=None,
+    *,
+    stability_model,
 ):
     roots = load_bertini_real_finite_solutions(bertini_file)
 
@@ -1048,6 +1107,7 @@ def compare_bertini_roots_and_ground_truth(
         margin_x=STATE_MARGIN_X,
         margin_y=STATE_MARGIN_Y,
         residual_tol=1e-7,
+        stability_model=stability_model,
     )
 
     points = list(roots)
@@ -1066,6 +1126,7 @@ def compare_bertini_roots_and_ground_truth(
         b_raw=b_raw,
         exps_f1=exps_f1,
         exps_f2=exps_f2,
+        stability_model=stability_model,
     )
 
     return roots, df_roots, df_compare
@@ -1186,6 +1247,8 @@ def collect_stable_roots_from_bertini(
     margin_y=STATE_MARGIN_Y,
     residual_tol=1e-6,
     require_in_box=True,
+    *,
+    stability_model,
 ):
     roots = load_bertini_real_finite_solutions(bertini_file)
 
@@ -1202,6 +1265,7 @@ def collect_stable_roots_from_bertini(
         margin_x=margin_x,
         margin_y=margin_y,
         residual_tol=residual_tol,
+        stability_model=stability_model,
     )
 
     # Appendix A: roots are retained only when residual < 1e-6.
@@ -1255,6 +1319,8 @@ def sweep_bertini_over_parameters(
     coeff_thresh=1e-10,
     save_csv_path=None,
     require_in_box=True,
+    *,
+    stability_model,
 ):
     bertini_workdir = Path(bertini_workdir)
     input_path = bertini_workdir / "input"
@@ -1303,6 +1369,7 @@ def sweep_bertini_over_parameters(
                     exps_f1=exps_f1,
                     exps_f2=exps_f2,
                     require_in_box=require_in_box,
+                    stability_model=stability_model,
                 )
                 if len(df_stable) > 0:
                     all_rows.append(df_stable)
@@ -1344,6 +1411,8 @@ def scan_wi_and_collect_roots(
     coeff_thresh=1e-10,
     require_in_box=True,
     save_csv_path=None,
+    *,
+    stability_model,
 ):
     Wi_values = list(range(Wi_start, Wi_end + 1, Wi_step))
 
@@ -1359,6 +1428,7 @@ def scan_wi_and_collect_roots(
         coeff_thresh=coeff_thresh,
         require_in_box=require_in_box,
         save_csv_path=save_csv_path,
+        stability_model=stability_model,
     )
 
     return df_all
@@ -1763,6 +1833,7 @@ if __name__ == "__main__":
         lambda_sparse=h["lambda_sparse"],
         w_det=h["w_det"],
         device=h["device"],
+        stability_model=result,
     )
 
     print("\n[Raw-space metrics]")
@@ -1817,6 +1888,7 @@ if __name__ == "__main__":
             coeff_thresh=1e-10,
             require_in_box=True,
             save_csv_path=None,
+            stability_model=result,
         )
 
         print(f"\n[Scanned stable roots for G={G_fixed}]")
@@ -1883,6 +1955,7 @@ if __name__ == "__main__":
                 coeff_thresh=1e-10,
                 require_in_box=True,
                 save_csv_path=None,
+                stability_model=result,
             )
             if len(df_g) > 0:
                 all_phase_rows.append(df_g)
